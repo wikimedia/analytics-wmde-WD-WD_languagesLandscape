@@ -37,31 +37,18 @@
 ### --- over the Wikidata JSON dumps in hdfs.
 ### ---------------------------------------------------------------------------
 
-### --------------------------------------------------------------
-### --- Section 1. ETL: Wikidata JSON Dump + Similarity Structures
-### --------------------------------------------------------------
-
 # - setup
 library(XML)
 library(data.table)
 library(stringr)
-library(spam)
-library(spam64)
-library(text2vec)
-library(WikidataR)
-library(httr)
 library(jsonlite)
 library(dplyr)
-library(htmltab)
 library(tidyr)
-library(Rtsne)
-library(ggplot2)
-library(ggrepel)
-library(scales)
-library(igraph)
+library(httr)
+library(htmltab)
 
 # - to runtime Log:
-print(paste("--- WD_processDump_spark.R RUN STARTED ON:", 
+print(paste("--- WD_LanguagesLandscape.R RUN STARTED ON:", 
             Sys.time(), sep = " "))
 # - GENERAL TIMING:
 generalT1 <- Sys.time()
@@ -78,9 +65,6 @@ fPath <- paste(
 params <- xmlParse(paste0(fPath, "WD_LanguagesLandscape_Config.xml"))
 params <- xmlToList(params)
 
-### --- Functions
-source(paste0(fPath, 'WD_LanguagesLandscape_Functions.R'))
-
 ### --- Directories
 dataDir <- params$general$dataDir
 logDir <- params$general$logDir
@@ -94,16 +78,13 @@ sparkNumExecutors <- params$spark$num_executors
 sparkDriverMemory <- params$spark$driver_memory
 sparkExecutorMemory <- params$spark$executor_memory
 sparkExecutorCores <- params$spark$executor_cores
-# - ML parameters
-tsne_theta <- as.numeric(params$general$tSNE_Theta)
-# - Set proxy
-Sys.setenv(
-  http_proxy = params$general$http_proxy,
-  https_proxy = params$general$http_proxy)
 
 ### ---------------------------------------------------
-### --- 1.1 The Fundamental Dataset
+### --- 1 The Fundamental Datasets
 ### ---------------------------------------------------
+
+# - clean dataDir
+file.remove(paste0(dataDir, list.files(dataDir)))
 
 ### --- Spark ETL: WD Dump processing
 # - to runtime Log:
@@ -122,13 +103,36 @@ system(command = paste0('sudo -u analytics-privatedata spark2-submit ',
                         paste0(fPath, 'WD_LanguagesLandscape.py')),
        wait = T)
 
-# - clean dataDir
-setwd(dataDir)
-file.remove(list.files())
+### --- Map-Reduce ETL: WD re-use dataset
+### --- ETL from goransm.wdcm_clients_wb_entity_usage
+### --- w. HiveQL from Beeline
+filename <- paste0(dataDir, "wd_entities_reuse.tsv")
+queryFile <- paste0(fPath, "wd_reuse_HiveQL_Query.hql")
+kerberosPrefix <- 'sudo -u analytics-privatedata kerberos-run-command analytics-privatedata '
+hiveQLquery <- 'SET hive.mapred.mode=unstrict; SELECT eu_entity_id, COUNT(*) AS eu_count FROM 
+                  (SELECT DISTINCT eu_entity_id, eu_page_id, wiki_db FROM goransm.wdcm_clients_wb_entity_usage) 
+                AS t GROUP BY eu_entity_id;'
+# - write hql
+write(hiveQLquery, queryFile)
+# - to Report
+print("Fetching reuse data from goransm.wdcm_clients_wb_entity_usage.")
+# - Kerberos init
+system(command = paste0(kerberosPrefix, ' hdfs dfs -ls'), 
+       wait = T)
+# - Run query
+query <- system(command = paste(kerberosPrefix, 
+                                '/usr/local/bin/beeline --incremental=true --silent -f "',
+                                paste0(queryFile),
+                                '" > ', filename,
+                                sep = ""),
+                wait = TRUE)
+# - to Report
+print("DONE w. ETL from Hadoop: WD re-use dataset.")
+print("DONE w. fundamental dataset production.")
 
-### --- Compose final usage dataset from hdfs
+### --- Compose labels dataset from hdfs
 # - to runtime Log:
-print(paste("--- Collect Final Data Set STARTED ON:", 
+print(paste("--- Collect Final Labels Dataset STARTED ON:", 
             Sys.time(), sep = " "))
 # - copy splits from hdfs to local dataDir
 # - from statements:
@@ -136,9 +140,9 @@ system(paste0('sudo -u analytics-privatedata kerberos-run-command analytics-priv
               hdfsPath, 'wd_dump_item_language > ', 
               dataDir, 'files.txt'), 
        wait = T)
-files <- read.table('files.txt', skip = 1)
+files <- read.table(paste0(dataDir, 'files.txt'), skip = 1)
 files <- as.character(files$V8)[2:length(as.character(files$V8))]
-file.remove('files.txt')
+file.remove(paste0(dataDir, 'files.txt'))
 for (i in 1:length(files)) {
   system(paste0('sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -text ', 
                 files[i], ' > ',  
@@ -146,9 +150,10 @@ for (i in 1:length(files)) {
 }
 # - read splits: dataSet
 # - load
-lF <- list.files()
+lF <- list.files(dataDir)
 lF <- lF[grepl("wd_dump_item_language", lF)]
-dataSet <- lapply(lF, function(x) {fread(x, header = F)})
+dataSet <- lapply(paste0(dataDir, lF), 
+                  function(x) {fread(x, header = F)})
 # - collect
 dataSet <- rbindlist(dataSet)
 # - schema
@@ -163,161 +168,74 @@ uniqueLanguageCodes <- sort(unique(dataSet$language))
 # - collect stats
 stats$uniqueN_Labels <- length(uniqueLanguageCodes)
 
-### ---------------------------------------------------
-### --- 1.2 The WDCM Re-use data
-### ---------------------------------------------------
-
-# - clean dataDir
-setwd(dataDir)
-file.remove(list.files())
-
-### --- Compose final re-use dataset from hdfs
-# - to runtime Log:
-print(paste("--- Collect Re-use Data Set STARTED ON:", 
-            Sys.time(), sep = " "))
-# - copy splits from hdfs to local dataDir
-# - from statements:
-system(paste0('sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -ls ', 
-              hdfsPath, 'wd_entity_reuse > ', 
-              dataDir, 'files.txt'), 
-       wait = T)
-files <- read.table('files.txt', skip = 1)
-files <- as.character(files$V8)[2:length(as.character(files$V8))]
-file.remove('files.txt')
-for (i in 1:length(files)) {
-  system(paste0('sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -text ', 
-                files[i], ' > ',  
-                paste0(dataDir, "wd_entity_reuse", i, ".csv")), wait = T)
-}
-# - read splits: dataSet
-# - load
-lF <- list.files()
-lF <- lF[grepl("wd_entity_reuse", lF)]
-wdcmReuse <- lapply(lF, function(x) {fread(x, header = F)})
-# - collect
-wdcmReuse <- rbindlist(wdcmReuse)
-# - schema
-colnames(wdcmReuse) <- c('entity', 'reuse')
-wdcmReuse <- dplyr::arrange(wdcmReuse, 
-                            desc(reuse))
-
-# - collect stats
-stats$totalN_entities_reused <- dim(wdcmReuse)[1]
-
-# - store
-write.csv(wdcmReuse,
-          paste0(outDir, "wd_entities_reuse.csv"))
-# - clear
-rm(wdcmReuse); gc()
-
-### ---------------------------------------------------
-### --- 2. Consolidate the Fundamental Dataset
-### ---------------------------------------------------
-
-# - languages w. more scripts --> unique language
-# - reference: https://www.wikidata.org/wiki/Help:Wikimedia_language_codes/lists/all
-# - get reference table
-url <- "https://www.wikidata.org/wiki/Help:Wikimedia_language_codes/lists/all"
-WD_Lang <- htmltab(doc = url)
-# - fix error in WD_Lang[1, 1] which is: "<no value>kea"
-WD_Lang[1, 1] <- gsub("<no value>", "", WD_Lang[1, 1]) 
-WD_Lang <- WD_Lang[, c(1, 2, 3, 4, 5, 6, 9, 10)]
-colnames(WD_Lang) <- c('WikimediaCode', 
-                       'Qid', 
-                       'NativeName_P1705', 
-                       'NativeName_Mediawiki', 
-                       'EnglishLabel', 
-                       'EnglishLabel_Mediawiki', 
-                       'InstanceOf_P31', 
-                       'SubclassOf_P279')
-w <- which(grepl("script|syllabics", WD_Lang$EnglishLabel_Mediawiki, ignore.case = T))
-scriptVariants <- WD_Lang$WikimediaCode[w]
-# - fix 'crh-latncrh-Latn'
-scriptVariants[which(scriptVariants == 'crh-latncrh-Latn')] <- 'crh-latn'
-scriptVariants <- append(scriptVariants, 'crh-Latn')
-# - find script variants in dataSet
-w <- which(dataSet$language %in% scriptVariants)
-dataSet$language[w] <- str_extract(dataSet$language[w], ".+-")
-dataSet$language[w] <- sapply(dataSet$language[w], function(x) {
-  strsplit(x, split = "-")[[1]][1]
-})
-dataSet <- dataSet[!duplicated(dataSet), ]
-# - collect stats
-stats$totalN_Languages <- dim(dataSet)[1]
-uniqueLanguages <- sort(unique(dataSet$language))
-stats$uniqueN_Languages <- length(uniqueLanguages)
-# - correct where two language codes can be used 
-# - for the same language (e.g. 'zh-classical' and 'lzh' 
-# - are both Q37041: Classical Chinese)
-# - rule: use the lengthier of the two available codes
-# - (e.g. replace 'lzh' w. 'zh-classical')
-correctFrame <- data.frame(targetCode = c('als', 'sgs', 'be-x-old', 
-                                          'bh', 'vro', 'nrm', 'roa-tara', 'simple',
-                                          'en-simple', 'lzh', 'nan', 'yue'
-                                          ), 
-                           sourceCode = c('gsw', 'bat-smg', 'be-tarask', 
-                                          'bho', 'fiu-vro', 'fr-x-nrm', 'it-x-tara', 'en-x-simple', 
-                                          'en-x-simple', 'zh-classical', 'zh-min-nan', 'zh-yue'), 
-                           stringsAsFactors = F)
-ix <- match(dataSet$language, correctFrame$target)
-w <- which(!is.na(ix))
-ix <- ix[w]
-dataSet$language[w] <- correctFrame$sourceCode[ix]
-# - collect stats
-stats$totalN_Languages <- dim(dataSet)[1]
-uniqueLanguages <- sort(unique(dataSet$language))
-stats$uniqueN_Languages <- length(uniqueLanguages)
-
 # - store
 saveRDS(dataSet,
         paste0(outDir, "wd_entities_languages.Rds"))
 
 ### ---------------------------------------------------
-### --- 3. Per item and per language re-use statistics
+### --- 2. Per item and per language re-use statistics
 ### ---------------------------------------------------
 
 ### --- how many languages, per item:
-itemCount <- as.data.frame(table(dataSet$entity))
+setkey(dataSet, entity)
+itemCount <- dataSet[, .N ,by = entity]
+
 # - remove DataSet: save memory on stat100*
 rm(dataSet); gc()
 colnames(itemCount) <- c('entity', 'language_count')
 
-# - load re-use data
-wdcmReuse <- fread(paste0(outDir, "wd_entities_reuse.csv"), 
-                   header = T)
-wdcmReuse$V1 <- NULL
-# - left join: wdcmReuse on itemCount
-itemCount <- dplyr::left_join(itemCount, 
-                              wdcmReuse, 
-                              by = "entity")
-itemCount$reuse[is.na(itemCount$reuse)] <- 0
+### --- WDCM Usage dataset
+wdcmReuse <- fread(paste0(
+  dataDir, 'wd_entities_reuse.tsv'), 
+  sep = "\t")
+
+# - schema
+colnames(wdcmReuse) <- c('entity', 'reuse')
+setkey(wdcmReuse, entity)
+setorder(wdcmReuse, -reuse)
+
+# - collect stats
+stats$totalN_entities_reused <- dim(wdcmReuse)[1]
+
 # - store
-write.csv(itemCount,
-          paste0(outDir, "wd_entities_count.csv"))
+saveRDS(wdcmReuse,
+        paste0(outDir, "wd_entities_reuse.Rds"))
+
+# - left join: wdcmReuse on itemCount
+itemCount <- merge(itemCount, 
+                   wdcmReuse, 
+                   by = "entity", 
+                   all.x = TRUE)
+itemCount <- itemCount[!is.na(reuse)]
+
+# - store
+saveRDS(itemCount,
+        paste0(outDir, "wd_entities_count.Rds"))
 rm(itemCount); gc()
+
 # - load fundamental data set
 dataSet <- readRDS(paste0(outDir, "wd_entities_languages.Rds"))
 
 # - left join: wdcmReuse on dataSet
-dataSet <- dplyr::left_join(dataSet,
-                            wdcmReuse,
-                            by = "entity")
+setkey(dataSet, entity)
+dataSet <- merge(dataSet,
+                 wdcmReuse,
+                 by = "entity",
+                 all.x = TRUE)
 # - clear
 rm(wdcmReuse); gc()
+
 # - compute re-use per language
-countUsedItems <- dataSet %>% 
-  dplyr::filter(!is.na(reuse)) %>% 
-  dplyr::select(language) %>% 
-  dplyr::group_by(language) %>% 
-  dplyr::summarise(num_items_reused = n())
-dataSet$reuse[is.na(dataSet$reuse)] <- 0
-dataSet <- dataSet %>% 
-  dplyr::select(language, reuse) %>% 
-  dplyr::group_by(language) %>% 
-  summarise(item_count = n(), reuse = sum(reuse))
-dataSet <- dplyr::left_join(dataSet, 
-                            countUsedItems, 
-                            by = "language")
+countUsedItems <- dataSet[!is.na(reuse), .N, by = "language"]
+colnames(countUsedItems)[2] <- 'num_items_reused'
+dataSet[is.na(reuse), reuse := 0]
+dataSet <- dplyr::select(dataSet, -entity)
+dataSet <- dataSet[, .(reuse = sum(reuse), item_count = .N), by = "language"]
+dataSet <- merge(dataSet,
+                 countUsedItems,
+                 by = "language",
+                 all.x = TRUE)
+
 # - store
 write.csv(dataSet,
           paste0(outDir, "wd_languages_count.csv"))
@@ -325,10 +243,10 @@ rm(dataSet); gc()
 
 
 ### ---------------------------------------------------
-### --- 4. The Co-Occurence and Similarity Matrices
+### --- 3. The Co-Occurence and Similarity Matrices
 ### --- from the Fundamental Dataset
 ### ---------------------------------------------------
-rm(list = setdiff(ls(), 'params'))
+rm(list = setdiff(ls(), c('params', 'fPath')))
 
 library(XML)
 library(data.table)
@@ -347,9 +265,6 @@ library(ggplot2)
 library(ggrepel)
 library(scales)
 library(igraph)
-
-params <- xmlParse(paste0(fPath, "WD_LanguagesLandscape_Config.xml"))
-params <- xmlToList(params)
 
 ### --- Directories
 dataDir <- params$general$dataDir
@@ -370,6 +285,9 @@ tsne_theta <- as.numeric(params$general$tSNE_Theta)
 Sys.setenv(
   http_proxy = params$general$http_proxy,
   https_proxy = params$general$http_proxy)
+
+### --- Functions
+source(paste0(fPath, 'WD_LanguagesLandscape_Functions.R'))
 
 # - load fundamental data set
 dataSet <- readRDS(paste0(outDir, "wd_entities_languages.Rds"))
@@ -505,7 +423,6 @@ print(paste0("Binary contingency in: ",
 # - clean-up dataSet
 rm(dataSet); gc()
 # - compute Jaccard Similarity Matrix
-t1 <- Sys.time()
 distMatrix <- sim2(x = cT, y = NULL, 
                    method = "jaccard", 
                    norm = "none")
@@ -554,10 +471,10 @@ write.csv(tsne2DMap,
           paste0(outDir, "WD_tsne2DMap_from_Jaccard_Distance.csv"))
 
 ### --------------------------------------------------------------
-### --- 5. Wikidata Language Data Model: WDQS
+### --- 4. Wikidata Language Data Model: WDQS
 ### --------------------------------------------------------------
 
-usedLanguages <- read.csv(paste0(outDir, "/wd_languages_count.csv"),
+usedLanguages <- read.csv(paste0(outDir, "wd_languages_count.csv"),
                           header = T, 
                           check.names = F,
                           row.names = 1,
@@ -655,17 +572,6 @@ usedLanguages <- dplyr::left_join(usedLanguages,
                                   by = c("language" = "wikimediaCode"))
 colnames(usedLanguages)[5] <- 'languageURI'
 
-# - fix Q2087886:`be-tarask`, which is a P279 of Q43091(Orthography)
-w_be_x_old <- which(usedLanguages$language %in% "be-tarask")
-usedLanguages$languageURI[w_be_x_old] <- 'Q2087886'
-usedLanguages$description[w_be_x_old] <- 'orthography of the Belarusian language'
-d_be_x_old <- data.frame(language = usedLanguages$languageURI[w_be_x_old],
-                         languageLabel = 'Taraškievica', 
-                         wikimediaCode = 'be-tarask', 
-                         description = usedLanguages$description[w_be_x_old])
-dataModel <- rbind(dataModel,
-                   d_be_x_old)
-
 ### --- Find duplicated languages (i.e. more than one Wikimedia language code)
 # - compare the Wikimedia language codes in dataModel with the unique codes found in
 # - languageUsage data.frame:
@@ -688,6 +594,7 @@ dataModel$duplicated <- sapply(dataModel$language, function(x) {
     return(FALSE)
   }
 })
+
 # - remove language duplicates: where their Wikimedia language code is
 # - not used:
 dataModel <- dplyr::filter(dataModel,
@@ -747,7 +654,7 @@ for (i in 1:length(lprops)) {
     gprops <- lapply(gprops, function(x) {flatten(x, recursive = TRUE)})
     gprops <- rbindlist(gprops, fill = T, use.names = T)
     gprops$language <- x
-    gprops$languageLabel <- dataModel$languageLabel[which(dataModel$language %in% x)]
+    gprops$languageLabel <- dataModel$languageLabel[which(dataModel$language %in% x)][1]
     if ('property' %in% colnames(gprops)) {
       gprops <- dplyr::left_join(gprops, 
                                  dmodelProps,
@@ -768,7 +675,9 @@ for (i in 1:length(lprops)) {
 }
 # - complete lprops
 w <- which(is.na(lprops))
-lprops[w] <- NULL
+if (length(w) > 0) {
+  lprops[w] <- NULL 
+}
 lprops <- rbindlist(lprops, fill = T, use.names = T)
 # - filter out P1098 (number of speakers)
 w <- which(lprops$propertyLabel %in% 'numberOfSpeakers')
@@ -880,6 +789,7 @@ usedLanguages <- dplyr::left_join(usedLanguages,
                                                 wikimediaCode, value),
                                   by = c("language" = "wikimediaCode"))
 colnames(usedLanguages)[7] <- 'EthnologueLanguageCode'
+
 # - add: EthnologueLanguageStatus (P3823)
 EthnologueLanguageStatus <- dplyr::filter(dataModel_properties,
                                           property == 'EthnologueLanguageStatus (P3823)') %>%
@@ -890,6 +800,7 @@ usedLanguages <- dplyr::left_join(usedLanguages,
                                                 wikimediaCode, value),
                                   by = c("language" = "wikimediaCode"))
 colnames(usedLanguages)[8] <- 'EthnologueLanguageStatus'
+
 # - add: UNESCOLanguageStatus (P1999)
 UNESCOLanguageStatus <- dplyr::filter(dataModel_properties,
                                       property == 'UNESCOLanguageStatus (P1999)') %>%
@@ -900,6 +811,7 @@ usedLanguages <- dplyr::left_join(usedLanguages,
                                                 wikimediaCode, value),
                                   by = c("language" = "wikimediaCode"))
 colnames(usedLanguages)[9] <- 'UNESCOLanguageStatus'
+
 # - add: numSitelinks from dataModel_basic:
 usedLanguages <- dplyr::left_join(usedLanguages, 
                                   dplyr::select(dataModel_basic, 
@@ -907,7 +819,6 @@ usedLanguages <- dplyr::left_join(usedLanguages,
                                   by = c("languageURI" = "language"))
 write.csv(usedLanguages, 
           paste0(outDir, 'WD_Languages_UsedLanguages.csv'))
-
 
 ### --------------------------------------------------------------
 ### --- 6. Production Visualisation Data Sets
@@ -934,7 +845,6 @@ colnames(pFrame) <- c('Language Code',
                       'Language', 
                       'UNESCO Language Status', 
                       'Labels')
-
 write.csv(pFrame, 
           paste0(outDir, "WD_Vis_UNESCO Language Status_NumItems.csv"))
 
@@ -974,7 +884,6 @@ colnames(pFrame) <- c('Language Code',
                       'Language', 
                       'Ethnologue Language Status', 
                       'Labels')
-
 write.csv(pFrame, 
           paste0(outDir, "WD_Vis_EthnologueLanguageStatus_NumItems.csv"))
 
@@ -1015,7 +924,7 @@ write.csv(dC,
 ### --------------------------------------------------------------
 ### --- 7. Copy data to publicDir
 ### --------------------------------------------------------------
-rm(list = setdiff(ls(), c('outDir', 'publicDir')))
+publicDir <- params$general$pubDataDir
 
 write(paste0("Last updated on: ", Sys.time()), 
       paste0(outDir, "WDLanguagesUpdateString.txt"))

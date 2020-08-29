@@ -12,6 +12,7 @@ library(shinycssloaders)
 library(DT)
 library(visNetwork)
 library(plotly)
+library(dygraphs)
 
 # - options
 options(warn = -1)
@@ -39,10 +40,16 @@ shinyUI(
                 dashboardSidebar(
                   sidebarMenu(
                     id = "tabsWDCM",
+                    menuItem(text = "Datamodel: Terms", 
+                             tabName = "datamodel", 
+                             icon = icon("barcode"),
+                             selected = TRUE
+                             
+                    ),
                     menuItem(text = "Ontology", 
                              tabName = "ontology", 
                              icon = icon("barcode"),
-                             selected = TRUE
+                             selected = FALSE
                              
                     ),
                     menuItem(text = "Language/Class", 
@@ -93,6 +100,93 @@ shinyUI(
                     
                     ### --- TAB: Ontology
                     ### --------------------------------
+                    tabItem(tabName = "datamodel",
+                            fluidRow(
+                              column(width = 9,
+                                     fluidRow(
+                                       column(width = 12,
+                                              br(),
+                                              HTML('<p style="font-size:80%;"align="left"><b>TERMS IN THE WIKIDATA DATAMODEL.</b> The upper row shows the total number of 
+                                                    labels, aliases, and descriptions present in Wikidata, taking all languages into consideration, in a particular point in time. Each data point (hover 
+                                                    over them - they are labeled) represents one timestamped snapshot of the <a href="https://wikitech.wikimedia.org/wiki/Analytics/Data_Lake/Edits/Wikidata_entity" target="_blank">wmf.wikidata_entity</a>
+                                                   table, which means that each data point corresponds to exactly one version of the Wikidata dump. 
+                                                  The bottom row displays the data on labels, aliases, and descriptions for a particular, selected language. 
+                                                  The datasets can be found here: <a href="https://analytics.wikimedia.org/published/datasets/wmde-analytics-engineering/Wikidata/wd_datamodel_terms/" target="_blank">wd_datamodel_terms.</a> 
+                                                  <b>Please be patient until the data download.</b>
+                                                   </p>'),
+                                              hr()
+                                              )
+                                       )
+                                     ),
+                              column(width = 3,
+                                     HTML('<p style="font-size:80%;"align="right">
+                                          <a href = "https://meta.wikimedia.org/wiki/Wikidata_Languages_Landscape" target="_blank">Documentation</a><br>
+                                          <a href = "https://analytics.wikimedia.org/datasets/wmde-analytics-engineering/Wikidata/WD_Languages_Landscape/" target = "_blank">Public datasets</a><br>
+                                          <a href = "https://github.com/wikimedia/analytics-wmde-WD-WD_languagesLandscape" target = "_blank">GitHub</a></p>')
+                                     )
+                              ),
+                            fluidRow(
+                              column(width = 4,
+                                     align = "left",
+                                     htmlOutput("average_labels"),
+                                     withSpinner(dygraphOutput("datamodelLabels")),
+                                     hr()
+                                     ),
+                              column(width = 4,
+                                     align = "left",
+                                     htmlOutput("average_descriptions"),
+                                     withSpinner(dygraphOutput("datamodelDescriptions")),
+                                     hr()
+                                     ),
+                              column(width = 4,
+                                     align = "left",
+                                     htmlOutput("average_aliases"),
+                                     withSpinner(dygraphOutput("datamodelAliases")),
+                                     hr()
+                                     )
+                            ),
+                            fluidRow(
+                              column(width = 4,
+                                     align = "left",
+                                     selectizeInput('languages',
+                                                    'Select language:',
+                                                    choices = NULL,
+                                                    multiple = FALSE)
+                              )
+                            ),
+                            fluidRow(
+                              column(width = 4,
+                                     align = "left",
+                                     withSpinner(dygraphOutput("dataModelLang_Labels")),
+                                     hr()
+                                     ),
+                              column(width = 4,
+                                     align = "left",
+                                     withSpinner(dygraphOutput("dataModelLang_Descriptions")),
+                                     hr()
+                                     ),
+                              column(width = 4,
+                                     align = "left",
+                                     withSpinner(dygraphOutput("dataModelLang_Aliases")),
+                                     hr()
+                                     )
+                            ),
+                            fluidRow(
+                              hr(),
+                              column(width = 2,
+                                     br(),
+                                     img(src = 'Wikidata-logo-en.png',
+                                         align = "left")
+                              ),
+                              column(width = 10,
+                                     hr(),
+                                     HTML('<p style="font-size:80%;"><b>WD Languages Landscape :: Wikidata, WMDE 2019</b><br></p>'),
+                                     HTML('<p style="font-size:80%;"><b>Contact:</b> Goran S. Milovanovic, Data Scientist, WMDE<br>
+                                          <b>e-mail:</b> goran.milovanovic_ext@wikimedia.de<br><b>IRC:</b> goransm</p>'),
+                                     br(), br()
+                              )
+                            )
+                            ), # - end tab: datamodel,
                     
                     tabItem(tabName = "ontology",
                             fluidRow(
@@ -154,7 +248,7 @@ shinyUI(
                                      br(), br()
                               )
                             )
-                              ), # - end tab: Ontology
+                            ), # - end tab: Ontology
                     
                     
                     ### --- TAB: languageclass

@@ -13,6 +13,7 @@ library(shinydashboard)
 library(data.table)
 library(stringr)
 library(dplyr)
+library(XML)
 ### --- visualize
 library(DT)
 library(visNetwork)
@@ -21,149 +22,221 @@ library(ggplot2)
 library(scales)
 library(plotly)
 library(ape)
+library(dygraphs)
+library(xts)
 ### --- connect
 library(httr)
 library(curl)
 
-### --------------------------------
-### --- Server (Session) Scope
-### --------------------------------
-
-
-### --- Fetch data files
-
-### --- Fetch ontology structure
-ontologyStructure <- read.csv('data/WD_Languages_OntologyStructure.csv', 
-                              header = T, 
-                              row.names = 1, 
-                              check.names = F,
-                              stringsAsFactors = F)
-### --- Fetch used languages
-usedLanguages <- read.csv('data/WD_Languages_UsedLanguages.csv',
-                          header = T,
-                          row.names = 1,
-                          check.names = F,
-                          stringsAsFactors = F)
-usedLanguages$label <- paste0(tolower(usedLanguages$description), " (", 
-                              usedLanguages$languageURI, ")")
-# - Fetch Jaccard Similarity
-simData <- read.csv(paste0('data/',
-                           'WD_Languages_Jaccard_Similarity.csv'),
-                    header = T,
-                    row.names = 1,
-                    stringsAsFactors = F,
-                    check.names = F)
-simData$avg_reuse_per_item <- simData$reuse/simData$num_items_reused
-simData$prop_items_used <- simData$num_items_reused/simData$item_count
-
-# - create ontology nodes and edges
-# - nodes
-n1 <- paste0(ontologyStructure$itemLabel, " (", ontologyStructure$item, ")")
-n2 <- paste0(ontologyStructure$superClassLabel, " (", ontologyStructure$superClass, ")")
-ns <- unique(c(n1, n2))
-nodes <- data.frame(id = 1:length(ns),
-                    label = ns,
-                    shadow = T,
-                    stringsAsFactors = F)
-nodes$color <- 'lightgrey'
-nodes <- dplyr::left_join(nodes, 
-                          dplyr::select(usedLanguages, 
-                                        item_count, reuse, num_items_reused, 
-                                        EthnologueLanguageStatus, UNESCOLanguageStatus, 
-                                        numSitelinks, label),
-                          by = "label")
-nodes <- nodes[!duplicated(nodes), ]
-wDuplicated <- nodes$id[which(duplicated(nodes$id))]
-if (length(wDuplicated) > 0) {
-  fixDuplicates <- lapply(wDuplicated, function(x) {
-    d <- nodes[nodes$id %in% x, ]
-    d <- apply(d, 2, function(y) {
-      paste(unique(y), collapse = ", ")
-    })
-    d <- as.data.frame(t(d))
-    d
-  })
-  fixDuplicates <- rbindlist(fixDuplicates, fill = T, use.names = T)
-  eliminate <- which(nodes$id %in% wDuplicated)
-  if (length(eliminate > 0)) {
-    nodes <- nodes[-eliminate, ]
-    nodes <- rbind(nodes, fixDuplicates)
-  }
+### --- functions
+get_WDCM_table <- function(url_dir, filename, row_names) {
+  read.csv(paste0(url_dir, filename), 
+           header = T, 
+           stringsAsFactors = F,
+           check.names = F)
 }
-nodes$item_count <- as.numeric(levels(nodes$item_count))[nodes$item_count]
-nodes$reuse <- as.numeric(levels(nodes$reuse))[nodes$reuse]
-nodes$num_items_reused <- as.numeric(levels(nodes$num_items_reused))[nodes$num_items_reused]
-nodes$numSitelinks <- as.numeric(levels(nodes$numSitelinks))[nodes$numSitelinks]
-nodes$title <- paste0('<p style="font-family:helvetica;font-size:75%;"><b>', nodes$label, '</b><br>',
-                      ifelse(!is.na(nodes$item_count), paste0('Num.labels: ', nodes$item_count, '<br>'), ""),
-                      ifelse(!is.na(nodes$reuse), paste0('Reuse statistic: ', nodes$reuse, '<br>'), ""),
-                      ifelse(!is.na(nodes$num_items_reused), paste0('% of items reused: ', 
-                                                                    round(as.numeric(nodes$num_items_reused)/as.numeric(nodes$item_count)*100, 2), '<br>'), ""),
-                      ifelse(!is.na(nodes$numSitelinks), paste0('Num.sitelinks: ', nodes$numSitelinks, '<br>'), ""),
-                      ifelse(!is.na(nodes$UNESCOLanguageStatus), paste0('UNESCO status: ', nodes$UNESCOLanguageStatus, '<br>'), ""),
-                      ifelse(!is.na(nodes$EthnologueLanguageStatus), paste0('Ethnologue status: ', nodes$EthnologueLanguageStatus, '.<br>'), ""),
-                      '</p>')
-nodes$id <- 1:length(nodes$id)
-# - edges
-conceptsStruct <- data.frame(
-  from = sapply(paste0(ontologyStructure$itemLabel, " (", ontologyStructure$item, ")"), function(x) {
-    nodes$id[which(nodes$label %in% x)]
-  }),
-  to = sapply(paste0(ontologyStructure$superClassLabel, " (", ontologyStructure$superClass, ")"), function(x) {
-    nodes$id[which(nodes$label %in% x)]
-  }),
-  arrows = 'to',
-  label = ontologyStructure$relation,
-  dashes = ifelse(ontologyStructure$relation == 'P361', T, F),
-  font.size = 10,
-  stringsAsFactors = F)
 
-### --- fetch language status files
-status_UNESCO_Sitelinks <- read.csv('data/WD_Vis_UNESCO Language Status_Sitelinks.csv',
-                                    header = T,
-                                    row.names = 1,
-                                    check.names = F,
-                                    stringsAsFactors = F)
-status_Ethnologue_Sitelinks <- read.csv('data/WD_Vis_EthnologueLanguageStatus_Sitelinks.csv',
-                                    header = T,
-                                    row.names = 1,
-                                    check.names = F,
-                                    stringsAsFactors = F)
-status_UNESCO_numItems <- read.csv('data/WD_Vis_UNESCO Language Status_NumItems.csv',
-                                    header = T,
-                                    row.names = 1,
-                                    check.names = F,
-                                    stringsAsFactors = F)
-status_Ethnologue_numItems <- read.csv('data/WD_Vis_EthnologueLanguageStatus_NumItems.csv',
-                                        header = T,
-                                        row.names = 1,
-                                        check.names = F,
-                                        stringsAsFactors = F)
-status_UNESCO_reuse <- read.csv('data/WD_Vis_UNESCO Language Status_ItemReuse.csv',
-                                   header = T,
-                                   row.names = 1,
-                                   check.names = F,
-                                   stringsAsFactors = F)
-status_Ethnologue_reuse <- read.csv('data/WD_Vis_EthnologueLanguageStatus_ItemReuse.csv',
-                                       header = T,
-                                       row.names = 1,
-                                       check.names = F,
-                                       stringsAsFactors = F)
-
-# - fetch languagesCount as dataSet
-dataSet <- read.csv(paste0('data/wd_languages_count.csv'), 
-                    header = T,
-                    row.names = 1,
-                    stringsAsFactors = F,
-                    check.names = F)
-dataSet$avg_reuse_per_item <- dataSet$reuse/dataSet$num_items_reused
-dataSet$prop_items_used <- dataSet$num_items_reused/dataSet$item_count
-
-# - update string
-updateString <- readLines(paste0('data/WDLanguagesUpdateString.txt'))
+### --- Config File
+params <- xmlParse('WD_LanguagesLandscape_Config.xml')
+params <- xmlToList(params)
+apiPrefix <- params$apiPrefix
 
 ### --- shinyServer
 shinyServer(function(input, output, session) {
+  
+  ### --- DATA
+  
+  ### --- Fetch data files
+  withProgress(message = 'Downloading datasets.', detail = "Please be patient.", value = 0, {
+    
+    ### --- Fetch data files
+    
+    ### --- Fetch Datamodel Statistics
+    stats <- get_WDCM_table(params$general$publishedDatamodelDir,
+                             'datamodel_stats.csv',
+                             row_names = F)
+    avg_labels <- round(stats$num_labels/stats$num_items, 2)
+    avg_descriptions <- round(stats$num_descriptions/stats$num_items, 2)
+    avg_aliases <- round(stats$num_aliases/stats$num_items, 2)
+    
+    ### --- Fetch Datamodel Terms
+    incProgress(1/12, detail = "Datamodel terms.")
+    labels <- get_WDCM_table(params$general$publishedDatamodelDir,
+                             'DM_Terms_Labels.csv',
+                             row_names = F)
+    labels[, 1] <- NULL
+    descriptions <- get_WDCM_table(params$general$publishedDatamodelDir,
+                                   'DM_Terms_Descriptions.csv',
+                                   row_names = F)
+    descriptions[, 1] <- NULL
+    aliases <- get_WDCM_table(params$general$publishedDatamodelDir,
+                              'DM_Terms_Aliases.csv',
+                              row_names = F)
+    aliases[, 1] <- NULL
+    
+    ### --- Process Datamodel Terms
+    labelsGeneral <- labels %>% 
+      select(snapshot, count) %>% 
+      group_by(snapshot) %>% 
+      summarise(count = sum(count)) %>% 
+      arrange(snapshot)
+    labelsGeneral$countM <- labelsGeneral$count/1000000
+    aliasesGeneral <- aliases %>% 
+      select(snapshot, count) %>% 
+      group_by(snapshot) %>% 
+      summarise(count = sum(count)) %>% 
+      arrange(snapshot)
+    aliasesGeneral$countM <- aliasesGeneral$count/1000000
+    descriptionsGeneral <- descriptions %>% 
+      select(snapshot, count) %>% 
+      group_by(snapshot) %>% 
+      summarise(count = sum(count)) %>% 
+      arrange(snapshot)
+    descriptionsGeneral$countM <- descriptionsGeneral$count/1000000  
+  
+  ### --- Fetch ontology structure
+    incProgress(2/12, detail = "Ontology structure.")
+    ontologyStructure <- get_WDCM_table(params$general$publishedDataDir,
+                                        'WD_Languages_OntologyStructure.csv',
+                                        row_names = F)
+    ontologyStructure[, 1] <- NULL
+    
+    ### --- Fetch used languages
+    incProgress(3/12, detail = "Used languages.")
+    usedLanguages <- get_WDCM_table(params$general$publishedDataDir,
+                                    'WD_Languages_UsedLanguages.csv',
+                                    row_names = F)
+    usedLanguages[, 1] <- NULL
+    usedLanguages$label <- paste0(tolower(usedLanguages$description), " (", 
+                                  usedLanguages$languageURI, ")")
+    # - Fetch Jaccard Similarity
+    incProgress(4/12, detail = "Jaccard similarity.")
+    simData <- get_WDCM_table(params$general$publishedDataDir,
+                              'WD_Languages_Jaccard_Similarity.csv',
+                              row_names = F)
+    simData[, 1] <- NULL
+    simData$avg_reuse_per_item <- simData$reuse/simData$num_items_reused
+    simData$prop_items_used <- simData$num_items_reused/simData$item_count
+    
+    ### --- fetch language status files
+    incProgress(5/12, detail = "UNESCO Status - Sitelinks.")
+    status_UNESCO_Sitelinks <- get_WDCM_table(params$general$publishedDataDir,
+                                              URLencode('WD_Vis_UNESCO Language Status_Sitelinks.csv'),
+                                              row_names = F)
+    status_UNESCO_Sitelinks[, 1] <- NULL
+    incProgress(6/12, detail = "Ethnologue Status - Sitelinks.")
+    status_Ethnologue_Sitelinks <- get_WDCM_table(params$general$publishedDataDir,
+                                                  URLencode('WD_Vis_EthnologueLanguageStatus_Sitelinks.csv'),
+                                                  row_names = F)
+    status_Ethnologue_Sitelinks[, 1] <- NULL
+    incProgress(7/12, detail = "UNESCO Status - Items")
+    status_UNESCO_numItems <- get_WDCM_table(params$general$publishedDataDir,
+                                             URLencode('WD_Vis_UNESCO Language Status_NumItems.csv'),
+                                             row_names = F)
+    status_UNESCO_numItems[, 1] <- NULL
+    incProgress(8/12, detail = "Ethnologue Status - Items")
+    status_Ethnologue_numItems <- get_WDCM_table(params$general$publishedDataDir,
+                                                 URLencode('WD_Vis_EthnologueLanguageStatus_NumItems.csv'),
+                                                 row_names = F)
+    status_Ethnologue_numItems[, 1] <- NULL
+    incProgress(9/12, detail = "UNESCO Status - Re-use")
+    status_UNESCO_reuse <- get_WDCM_table(params$general$publishedDataDir,
+                                          URLencode('WD_Vis_UNESCO Language Status_ItemReuse.csv'),
+                                          row_names = F)
+    status_UNESCO_reuse[, 1] <- NULL
+    w_d <- which(duplicated(status_UNESCO_reuse$`Language Code`))
+    if (length(w_d) > 0) {
+      status_UNESCO_reuse <- status_UNESCO_reuse[-w_d, ]
+    }
+    
+    incProgress(10/12, detail = "Ethnologue Status - Re-use")
+    status_Ethnologue_reuse <- get_WDCM_table(params$general$publishedDataDir,
+                                              URLencode('WD_Vis_EthnologueLanguageStatus_ItemReuse.csv'),
+                                              row_names = F)
+    status_Ethnologue_reuse[, 1] <- NULL
+    
+    
+    # - fetch languagesCount as dataSet
+    incProgress(11/12, detail = "Language counts.")
+    dataSet <- get_WDCM_table(params$general$publishedDataDir,
+                              URLencode('wd_languages_count.csv'),
+                              row_names = F)
+    dataSet[, 1] <- NULL
+    dataSet$avg_reuse_per_item <- dataSet$reuse/dataSet$num_items_reused
+    dataSet$prop_items_used <- dataSet$num_items_reused/dataSet$item_count
+    
+    # - update string
+    incProgress(12/12, detail = "Update timestamp.")
+    updateString <- get_WDCM_table(params$general$publishedDataDir,
+                                   URLencode('WDLanguagesUpdateString.txt'),
+                                   row_names = F)
+    updateString <- colnames(updateString)
+  
+  }) ### --- Fetch data files (ENDS)
+  
+  ### - create ontology nodes and edges
+  # - nodes
+  n1 <- paste0(ontologyStructure$itemLabel, " (", ontologyStructure$item, ")")
+  n2 <- paste0(ontologyStructure$superClassLabel, " (", ontologyStructure$superClass, ")")
+  ns <- unique(c(n1, n2))
+  nodes <- data.frame(id = 1:length(ns),
+                      label = ns,
+                      shadow = T,
+                      stringsAsFactors = F)
+  nodes$color <- 'lightgrey'
+  nodes <- dplyr::left_join(nodes, 
+                            dplyr::select(usedLanguages, 
+                                          item_count, reuse, num_items_reused, 
+                                          EthnologueLanguageStatus, UNESCOLanguageStatus, 
+                                          numSitelinks, label),
+                            by = "label")
+  nodes <- nodes[!duplicated(nodes), ]
+  wDuplicated <- nodes$id[which(duplicated(nodes$id))]
+  if (length(wDuplicated) > 0) {
+    fixDuplicates <- lapply(wDuplicated, function(x) {
+      d <- nodes[nodes$id %in% x, ]
+      d <- apply(d, 2, function(y) {
+        paste(unique(y), collapse = ", ")
+      })
+      d <- as.data.frame(t(d))
+      d
+    })
+    fixDuplicates <- rbindlist(fixDuplicates, fill = T, use.names = T)
+    eliminate <- which(nodes$id %in% wDuplicated)
+    if (length(eliminate > 0)) {
+      nodes <- nodes[-eliminate, ]
+      nodes <- rbind(nodes, fixDuplicates)
+    }
+  }
+  nodes$item_count <- as.numeric(levels(nodes$item_count))[nodes$item_count]
+  nodes$reuse <- as.numeric(levels(nodes$reuse))[nodes$reuse]
+  nodes$num_items_reused <- as.numeric(levels(nodes$num_items_reused))[nodes$num_items_reused]
+  nodes$numSitelinks <- as.numeric(levels(nodes$numSitelinks))[nodes$numSitelinks]
+  nodes$title <- paste0('<p style="font-family:helvetica;font-size:75%;"><b>', nodes$label, '</b><br>',
+                        ifelse(!is.na(nodes$item_count), paste0('Num.labels: ', nodes$item_count, '<br>'), ""),
+                        ifelse(!is.na(nodes$reuse), paste0('Reuse statistic: ', nodes$reuse, '<br>'), ""),
+                        ifelse(!is.na(nodes$num_items_reused), paste0('% of items reused: ', 
+                                                                      round(as.numeric(nodes$num_items_reused)/as.numeric(nodes$item_count)*100, 2), '<br>'), ""),
+                        ifelse(!is.na(nodes$numSitelinks), paste0('Num.sitelinks: ', nodes$numSitelinks, '<br>'), ""),
+                        ifelse(!is.na(nodes$UNESCOLanguageStatus), paste0('UNESCO status: ', nodes$UNESCOLanguageStatus, '<br>'), ""),
+                        ifelse(!is.na(nodes$EthnologueLanguageStatus), paste0('Ethnologue status: ', nodes$EthnologueLanguageStatus, '.<br>'), ""),
+                        '</p>')
+  nodes$id <- 1:length(nodes$id)
+  # - edges
+  conceptsStruct <- data.frame(
+    from = sapply(paste0(ontologyStructure$itemLabel, " (", ontologyStructure$item, ")"), function(x) {
+      nodes$id[which(nodes$label %in% x)]
+    }),
+    to = sapply(paste0(ontologyStructure$superClassLabel, " (", ontologyStructure$superClass, ")"), function(x) {
+      nodes$id[which(nodes$label %in% x)]
+    }),
+    arrows = 'to',
+    label = ontologyStructure$relation,
+    dashes = ifelse(ontologyStructure$relation == 'P361', T, F),
+    font.size = 10,
+    stringsAsFactors = F)
+  
+  ### --- DATA (ENDS)
   
   ### ------------------------------------------
   ### --- Update String
@@ -172,6 +245,162 @@ shinyServer(function(input, output, session) {
   ### --- GENERAL: Update String
   output$updateString <- renderText({
     paste0('<p style="font-size:80%;"align="right"><b>', updateString, '</b></p>')
+  })
+  
+  output$average_labels <- renderText({
+    paste0('<p style="font-size:120%;"align="right"><b>',
+           "Avg. labels/item: ",
+           avg_labels, '</b></p>')
+  })
+  output$average_descriptions <- renderText({
+    paste0('<p style="font-size:120%;"align="right"><b>',
+           "Avg. descriptions/item: ",
+           avg_descriptions, '</b></p>')
+  })
+  output$average_aliases <- renderText({
+    paste0('<p style="font-size:120%;"align="right"><b>',
+           "Avg. aliases/item: ",
+           avg_aliases, '</b></p>')
+  })
+  
+  ### ------------------------------------------
+  ### --- TAB: tabPanel datamodel
+  ### ------------------------------------------
+  
+  output$datamodelLabels <- renderDygraph({
+    data <- dplyr::select(labelsGeneral, 
+                          snapshot,
+                          count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Labels") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(colors = "blue",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
+  })
+  
+  output$datamodelAliases <- renderDygraph({
+    data <- dplyr::select(aliasesGeneral, 
+                          snapshot,
+                          count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Aliases") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(colors = "orange",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
+  })
+  
+  output$datamodelDescriptions <- renderDygraph({
+    data <- dplyr::select(descriptionsGeneral, 
+                          snapshot,
+                          count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Descriptions") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(colors = "red",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
+  })
+  
+  # - select language for dataModelLang_ dygraphs
+  updateSelectizeInput(session,
+                       'languages',
+                       choices = unique(labels$language),
+                       selected = 'en',
+                       server = TRUE)
+  
+  output$dataModelLang_Labels <- renderDygraph({
+    data <- labels %>% 
+      dplyr::filter(language %in% input$languages) %>%
+      dplyr::select(snapshot, count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Labels") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(stackedGraph = T, 
+                colors = "blue",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
+  })
+  
+  output$dataModelLang_Aliases <- renderDygraph({
+    data <- aliases %>% 
+      dplyr::filter(language %in% input$languages) %>%
+      dplyr::select(snapshot, count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Aliases") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(stackedGraph = T, 
+                colors = "orange",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
+  })
+  
+  output$dataModelLang_Descriptions <- renderDygraph({
+    data <- descriptions %>% 
+      dplyr::filter(language %in% input$languages) %>%
+      dplyr::select(snapshot, count)
+    ix <- as.Date(data$snapshot)
+    data$snapshot <- NULL
+    data <- xts(data, order.by = ix)
+    dygraph(data, main = "Descriptions") %>% 
+      dyLegend(show = "follow", hideOnMouseOut = TRUE) %>% 
+      dyOptions(stackedGraph = T, 
+                colors = "red",
+                titleHeight = 20,
+                fillGraph = TRUE, fillAlpha = 0.4, 
+                drawPoints = TRUE, pointSize = 2, 
+                maxNumberWidth = 40, 
+                labelsKMB = TRUE) %>% 
+      dyHighlight(highlightCircleSize = 3, 
+                  highlightSeriesBackgroundAlpha = 0.2,
+                  hideOnMouseOut = TRUE) %>% 
+      dyRangeSelector(height = 25, strokeColor = "")
   })
   
   ### ------------------------------------------
@@ -221,7 +450,10 @@ shinyServer(function(input, output, session) {
                           reuse,
                           num_items_reused, 
                           numSitelinks)
-      ul <- ul[!duplicated(ul), ]
+      w_dul <- which(duplicated(ul$label))
+      if (length(w_dul) > 0) {
+        ul <- ul[-w_dul, ]
+      }
       vsnames <- dplyr::left_join(vsnames,
                                   ul, 
                                   by = c("id" = "label"))
@@ -682,9 +914,9 @@ shinyServer(function(input, output, session) {
                     y = log(Reuse),
                     text = paste0("WDCM Reuse statistic: ", Reuse),
                     color = `UNESCO Language Status`,
-                    size = log(`Items Reused`/Items),
+                    size = log(`Items Reused`),
                     label = Language,
-                    alpha = log(`Items Reused`/Items))) +
+                    alpha = log(`Items Reused`)/max(log(`Items Reused`)))) +
       geom_jitter(width = .1, fill = "white") +
       ggtitle("UNESCO Language Status and Item Reuse") + 
       scale_size_area(max_size = 4) +
@@ -719,9 +951,9 @@ shinyServer(function(input, output, session) {
                     y = log(Reuse),
                     text = paste0("WDCM Reuse statistic: ", Reuse),
                     color = `Ethnologue Language Status`,
-                    size = log(`Items Reused`/Items),
+                    size = log(`Items Reused`),
                     label = Language,
-                    alpha = log(`Items Reused`/Items))) +
+                    alpha = log(`Items Reused`/Items)/max(log(`Items Reused`/Items)))) +
       geom_jitter(width = .1, fill = "white") +
       ggtitle("Ethnologue Language Status and Item Reuse") + 
       scale_size_area(max_size = 4) +
