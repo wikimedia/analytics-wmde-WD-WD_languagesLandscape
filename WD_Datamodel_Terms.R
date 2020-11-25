@@ -33,6 +33,8 @@
 
 # - setup
 library(XML)
+library(httr)
+library(jsonlite)
 library(data.table)
 library(tidyverse)
 
@@ -59,13 +61,24 @@ dataDir <- params$general$datamodel_terms_dataDir
 publicDir <- params$general$datamodel_terms_publicDir
 logDir <- params$general$logDir
 
+### --- Set proxy
+Sys.setenv(
+  http_proxy = params$general$http_proxy,
+  https_proxy = params$general$https_proxy)
+
 ### --- Spark: spark2-submit parameters
+### --- spark2-submit parameters:
+params <- xmlParse(paste0(fPath, "WD_LanguagesLandscape_Config_Deploy.xml"))
+params <- xmlToList(params)
 sparkMaster <- params$spark$master
 sparkDeployMode <- params$spark$deploy_mode
 sparkNumExecutors <- params$spark$num_executors
 sparkDriverMemory <- params$spark$driver_memory
 sparkExecutorMemory <- params$spark$executor_memory
 sparkExecutorCores <- params$spark$executor_cores
+
+### --- WDQS Classes endPoint
+endPointURL <- params$general$wdqs_endpoint
 
 ### --- Check wmf.wikidata_entity snapshot
 # - Kerberos init
@@ -82,6 +95,7 @@ snaps <- read.csv(paste0(dataDir, 'wdsnaps.csv'),
                   stringsAsFactors = F)
 currentSnap <- tail(snaps$partition, 1)
 currentSnap <- substr(currentSnap, 10, 19)
+# - NOTE: the reference dataset for snapshot detection is DM_Terms_Labels.csv 
 labs <- read.csv(paste0(dataDir, 'DM_Terms_Labels.csv'), 
                  stringsAsFactors = F)
 stopSnap <- tail(labs$snapshot, 1)
@@ -90,10 +104,205 @@ rm(labs)
 ### --- If wmf.wikidata_entity is updated, update:
 if (currentSnap != stopSnap) {
   
-  # - wait: maybe the wmf.wikidata_entity table is not populated
+  # - wait 10 hours: maybe the wmf.wikidata_entity table is not populated
   Sys.sleep(10*60*60)
   
-  # - Spark ETL
+  # - first collect Astronomical Objects
+  astronomicalObjects = c(
+    'Q523', 'Q318', 'Q1931185', 'Q1457376', 'Q2247863', 'Q3863', 'Q83373',
+    'Q2154519', 'Q726242', 'Q1153690', 'Q204107', 'Q71963409', 'Q67206691',
+    'Q1151284', 'Q67206701', 'Q66619666', 'Q72802727', 'Q2168098', 'Q6243',
+    'Q72802508', 'Q11282', 'Q72803170', 'Q1332364', 'Q72802977', 'Q6999',
+    'Q1491746', 'Q272447', 'Q497654', 'Q204194', 'Q130019', 'Q744691',
+    'Q71798532', 'Q46587', 'Q11276', 'Q71965429', 'Q5871', 'Q72803622',
+    'Q72803426', 'Q3937', 'Q72803708', 'Q168845', 'Q24452', 'Q67201574',
+    'Q2557101', 'Q691269', 'Q13632', 'Q10451997', 'Q28738741', 'Q22247'
+  )
+  collected <- vector(mode = "list", length = length(astronomicalObjects))
+  for (i in 1:length(astronomicalObjects)) {
+    # - Construct Query:
+    query <- paste0('SELECT ?item WHERE { 
+                    SERVICE gas:service { 
+                    gas:program gas:gasClass "com.bigdata.rdf.graph.analytics.BFS" . 
+                    gas:program gas:in wd:', astronomicalObjects[i], ' .
+                    gas:program gas:linkType wdt:P279 .
+                    gas:program gas:out ?subClass .
+                    gas:program gas:traversalDirection "Reverse" .
+                    } . 
+                    ?item wdt:P31 ?subClass 
+  }') 
+    # - Run Query:
+    repeat {
+      res <- tryCatch({
+        GET(url = paste0(endPointURL, URLencode(query)))
+      },
+      error = function(condition) {
+        print("Something's wrong on WDQS: wait 10 secs, try again.")
+        Sys.sleep(10)
+        GET(url = paste0(endPointURL, URLencode(query)))
+      },
+      warning = function(condition) {
+        print("Something's wrong on WDQS: wait 10 secs, try again.")
+        Sys.sleep(10)
+        GET(url = paste0(endPointURL, URLencode(query)))
+      }
+      )  
+      if (res$status_code == 200) {
+        print(paste0(astronomicalObjects[i], ": success."))
+        break
+      } else {
+        print(paste0(astronomicalObjects[i], ": failed; retry."))
+        Sys.sleep(10)
+      }
+    }
+    # - Extract item IDs:
+    if (res$status_code == 200) {
+      
+      # - tryCatch rawToChar
+      # - NOTE: might fail for very long vectors
+      rc <- tryCatch(
+        {
+          rawToChar(res$content)
+        },
+        error = function(condition) {
+          return(FALSE)
+        }
+      )
+      
+      if (rc == FALSE) {
+        print("rawToChar() conversion failed. Skipping.")
+        next
+      }
+      
+      # - is.ExceptionTimeout
+      queryTimeout <- grepl("timeout", rc, ignore.case = TRUE)
+      if (queryTimeout) {
+        print("Query timeout (!)")
+      }
+      
+      rc <- data.frame(item = unlist(str_extract_all(rc, "Q[[:digit:]]+")), 
+                       stringsAsFactors = F)
+    } else {
+      print(paste0("Server response: ", res$status_code))
+    }
+    
+    collected[[i]] <- rc
+    
+    } # - end collect Astronomical Objects loop
+  # - wrangle + copy to hdfs collected
+  collected <- rbindlist(collected)
+  colnames(collected) <- 'id'
+  write.csv(collected, 
+            paste0(dataDir, 'collectedAstronomy.csv'))
+  # -  delete hdfsDir DataModelTermsCollectedItemsDir
+  system(command = 
+           paste0(
+             'sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -rm -r ',
+             'hdfs:///tmp/wmde/analytics/Wikidata/LanguagesLandscape/DataModelTermsCollectedItemsDir/'),
+         wait = T)
+  # -  make hdfsDir DataModelTermsCollectedItemsDir
+  system(command = 
+           paste0(
+             'sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -mkdir ',
+             'hdfs:///tmp/wmde/analytics/Wikidata/LanguagesLandscape/DataModelTermsCollectedItemsDir/'),
+         wait = T)
+  # -  copy to hdfsDir DataModelTermsCollectedItemsDir
+  print("---- Move to hdfs.")
+  hdfsC <- system(command = paste0('sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -put -f ',
+                                   dataDir, "collectedAstronomy.csv ",
+                                   'hdfs:///tmp/wmde/analytics/Wikidata/LanguagesLandscape/DataModelTermsCollectedItemsDir/'),
+                  wait = T)
+  
+  # - now collect Scientific Papers
+  scientificPapers = c('Q7318358', 'Q2782326', 'Q18918145', 
+                       'Q1504425', 'Q7316896', 'Q92998777', 
+                       'Q10885494', 'Q15706459', 'Q58901470', 
+                       'Q59458414', 'Q56478376', 'Q12183006', 
+                       'Q82969330', 'Q58900805')
+  collected <- vector(mode = "list", length = length(astronomicalObjects))
+  for (i in 1:length(scientificPapers)) {
+    # - Construct Query:
+    query <- paste0('SELECT ?item WHERE { 
+                    SERVICE gas:service { 
+                    gas:program gas:gasClass "com.bigdata.rdf.graph.analytics.BFS" . 
+                    gas:program gas:in wd:', scientificPapers[i], ' .
+                    gas:program gas:linkType wdt:P279 .
+                    gas:program gas:out ?subClass .
+                    gas:program gas:traversalDirection "Reverse" .
+                    } . 
+                    ?item wdt:P31 ?subClass 
+  }') 
+    # - Run Query:
+    repeat {
+      res <- tryCatch({
+        GET(url = paste0(endPointURL, URLencode(query)))
+      },
+      error = function(condition) {
+        print("Something's wrong on WDQS: wait 10 secs, try again.")
+        Sys.sleep(10)
+        GET(url = paste0(endPointURL, URLencode(query)))
+      },
+      warning = function(condition) {
+        print("Something's wrong on WDQS: wait 10 secs, try again.")
+        Sys.sleep(10)
+        GET(url = paste0(endPointURL, URLencode(query)))
+      }
+      )  
+      if (res$status_code == 200) {
+        print(paste0(scientificPapers[i], ": success."))
+        break
+      } else {
+        print(paste0(scientificPapers[i], ": failed; retry."))
+        Sys.sleep(10)
+      }
+    }
+    # - Extract item IDs:
+    if (res$status_code == 200) {
+      
+      # - tryCatch rawToChar
+      # - NOTE: might fail for very long vectors
+      rc <- tryCatch(
+        {
+          rawToChar(res$content)
+        },
+        error = function(condition) {
+          return(FALSE)
+        }
+      )
+      
+      if (rc == FALSE) {
+        print("rawToChar() conversion failed. Skipping.")
+        next
+      }
+      
+      # - is.ExceptionTimeout
+      queryTimeout <- grepl("timeout", rc, ignore.case = TRUE)
+      if (queryTimeout) {
+        print("Query timeout (!)")
+      }
+      
+      rc <- data.frame(item = unlist(str_extract_all(rc, "Q[[:digit:]]+")), 
+                       stringsAsFactors = F)
+    } else {
+      print(paste0("Server response: ", res$status_code))
+    }
+    
+    collected[[i]] <- rc
+    
+  } # - end collect Scientific Papers loop
+  # - wrangle + copy to hdfs collected
+  collected <- rbindlist(collected)
+  colnames(collected) <- 'id'
+  write.csv(collected, 
+            paste0(dataDir, 'collectedScientificPapers.csv'))
+  # -  copy to hdfsDir DataModelTermsCollectedItemsDir
+  print("---- Move to hdfs.")
+  hdfsC <- system(command = paste0('sudo -u analytics-privatedata kerberos-run-command analytics-privatedata hdfs dfs -put -f ',
+                                   dataDir, "collectedScientificPapers.csv ",
+                                   'hdfs:///tmp/wmde/analytics/Wikidata/LanguagesLandscape/DataModelTermsCollectedItemsDir/'),
+                  wait = T)
+  
+  ### --- Spark ETL
   # - to runtime Log:
   print(paste("--- WD_Datamodel_Terms.py STARTED ON:", 
               Sys.time(), sep = " "))
@@ -106,13 +315,11 @@ if (currentSnap != stopSnap) {
                           sparkNumExecutors, ' ',
                           sparkDriverMemory, ' ',
                           sparkExecutorMemory, ' ',
-                          sparkExecutorCores, ' ',
+                          sparkConfigDynamic, ' ',
                           paste0(fPath, 'WD_Datamodel_Terms.py')),
          wait = T)
   
-  # - update statistics
-  num_items <- read.csv(paste0(dataDir, "num_items.csv"))
-  num_items <- num_items[1, 1]
+  ### --- Update EVERYTHING
   
   # - update Labels
   labels <- read.csv(paste0(dataDir, 'DM_Terms_Labels.csv'),
@@ -124,11 +331,8 @@ if (currentSnap != stopSnap) {
                      header = T,
                      stringsAsFactors = F,
                      check.names = F)
-  update$snapshot <- currentSnap
   labels <- rbind(labels, update)
   write.csv(labels, paste0(dataDir, 'DM_Terms_Labels.csv'))
-  # - update statistics
-  num_labels <- sum(update$count)
   
   # - update aliases
   aliases <- read.csv(paste0(dataDir, 'DM_Terms_Aliases.csv'),
@@ -140,12 +344,9 @@ if (currentSnap != stopSnap) {
                      header = T,
                      stringsAsFactors = F,
                      check.names = F)
-  update$snapshot <- currentSnap
   colnames(update)[1] <- "language"
   aliases <- rbind(aliases, update)
   write.csv(aliases, paste0(dataDir, 'DM_Terms_Aliases.csv'))
-  # - update statistics
-  num_aliases <- sum(update$count)
   
   # - update descriptions
   descriptions <- read.csv(paste0(dataDir, 'DM_Terms_Descriptions.csv'),
@@ -157,25 +358,143 @@ if (currentSnap != stopSnap) {
                      header = T,
                      stringsAsFactors = F,
                      check.names = F)
-  update$snapshot <- currentSnap
   colnames(update)[1] <- "language"
   descriptions <- rbind(descriptions, update)
   write.csv(descriptions, paste0(dataDir, 'DM_Terms_Descriptions.csv'))
-  # - update statistics
-  num_descriptions <- sum(update$count)
   
-  # - statistics file
-  stats <- data.frame(num_items = num_items,
-                      num_labels = num_labels, 
-                      num_descriptions = num_descriptions,
-                      num_aliases = num_aliases)
-  write.csv(stats, paste0(dataDir, "datamodel_stats.csv"))
+  ### --- Update ASTRONOMICAL OBJECTS
+  
+  # - update Labels
+  labels <- read.csv(paste0(dataDir, 'DM_Terms_Labels_ASTRONOMY.csv'),
+                     header = T,
+                     row.names = 1,
+                     stringsAsFactors = F,
+                     check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Labels_ASTRONOMY.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  labels <- rbind(labels, update)
+  write.csv(labels, paste0(dataDir, 'DM_Terms_Labels_ASTRONOMY.csv'))
+  
+  # - update aliases
+  aliases <- read.csv(paste0(dataDir, 'DM_Terms_Aliases_ASTRONOMY.csv'),
+                      header = T,
+                      row.names = 1,
+                      stringsAsFactors = F,
+                      check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Aliases_ASTRONOMY.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  aliases <- rbind(aliases, update)
+  write.csv(aliases, paste0(dataDir, 'DM_Terms_Aliases_ASTRONOMY.csv'))
+  
+  # - update descriptions
+  descriptions <- read.csv(paste0(dataDir, 'DM_Terms_Descriptions_ASTRONOMY.csv'),
+                           header = T,
+                           row.names = 1,
+                           stringsAsFactors = F,
+                           check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Descriptions_ASTRONOMY.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  descriptions <- rbind(descriptions, update)
+  write.csv(descriptions, paste0(dataDir, 'DM_Terms_Descriptions_ASTRONOMY.csv'))
+
+  ### --- Update SCIENTIFIC PAPERS
+  
+  # - update Labels
+  labels <- read.csv(paste0(dataDir, 'DM_Terms_Labels_SCIENTIFICPAPERS.csv'),
+                     header = T,
+                     row.names = 1,
+                     stringsAsFactors = F,
+                     check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Labels_SCIENTIFICPAPERS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  labels <- rbind(labels, update)
+  write.csv(labels, paste0(dataDir, 'DM_Terms_Labels_SCIENTIFICPAPERS.csv'))
+  
+  # - update aliases
+  aliases <- read.csv(paste0(dataDir, 'DM_Terms_Aliases_SCIENTIFICPAPERS.csv'),
+                      header = T,
+                      row.names = 1,
+                      stringsAsFactors = F,
+                      check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Aliases_SCIENTIFICPAPERS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  aliases <- rbind(aliases, update)
+  write.csv(aliases, paste0(dataDir, 'DM_Terms_Aliases_SCIENTIFICPAPERS.csv'))
+  
+  # - update descriptions
+  descriptions <- read.csv(paste0(dataDir, 'DM_Terms_Descriptions_SCIENTIFICPAPERS.csv'),
+                           header = T,
+                           row.names = 1,
+                           stringsAsFactors = F,
+                           check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Descriptions_SCIENTIFICPAPERS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  descriptions <- rbind(descriptions, update)
+  write.csv(descriptions, paste0(dataDir, 'DM_Terms_Descriptions_SCIENTIFICPAPERS.csv'))
+  
+  ### --- Update EVERYTHING MINUS (ASTRONOMICAL OBJECTS + SCIENTIFIC PAPERS)
+  
+  # - update Labels
+  labels <- read.csv(paste0(dataDir, 'DM_Terms_Labels_EVERYTHINGMINUS.csv'),
+                     header = T,
+                     row.names = 1,
+                     stringsAsFactors = F,
+                     check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Labels_EVERYTHINGMINUS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  labels <- rbind(labels, update)
+  write.csv(labels, paste0(dataDir, 'DM_Terms_Labels_EVERYTHINGMINUS.csv'))
+  
+  # - update aliases
+  aliases <- read.csv(paste0(dataDir, 'DM_Terms_Aliases_EVERYTHINGMINUS.csv'),
+                      header = T,
+                      row.names = 1,
+                      stringsAsFactors = F,
+                      check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Aliases_EVERYTHINGMINUS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  aliases <- rbind(aliases, update)
+  write.csv(aliases, paste0(dataDir, 'DM_Terms_Aliases_EVERYTHINGMINUS.csv'))
+  
+  # - update descriptions
+  descriptions <- read.csv(paste0(dataDir, 'DM_Terms_Descriptions_EVERYTHINGMINUS.csv'),
+                           header = T,
+                           row.names = 1,
+                           stringsAsFactors = F,
+                           check.names = F)
+  update <- read.csv(paste0(dataDir, 'update_Descriptions_EVERYTHINGMINUS.csv'),
+                     header = T,
+                     stringsAsFactors = F,
+                     check.names = F)
+  colnames(update)[1] <- "language"
+  descriptions <- rbind(descriptions, update)
+  write.csv(descriptions, paste0(dataDir, 'DM_Terms_Descriptions_EVERYTHINGMINUS.csv'))
   
   # - copy to public directory:
-  cFiles <- c('DM_Terms_Labels.csv',
-              'DM_Terms_Aliases.csv',
-              'DM_Terms_Descriptions.csv',
-              'datamodel_stats.csv')
+  cFiles <- list.files(dataDir)
+  cFiles <- cFiles[grepl("^DM_Terms", cFiles)]
+  
   for (i in 1:length(cFiles)) {
     print(paste0('Copying: ', cFiles[i], ' to publicDir.'))
     system(command = 
@@ -207,42 +526,3 @@ print(paste("--- WD_Datamodel_Terms.R RUN ENDED ON:",
             Sys.time(), sep = " "))
 # - conclusion
 print("DONE. Exiting.")
-
-
-
-# ### ---- INIT
-# 
-# # DM_Terms_Aliases.csv
-# 
-# # - produce DM_Terms_Labels.csv
-# lF <- list.files(dataDir)
-# lF <- lF[grepl("DatamodelTerms_Labels", lF)]
-# dataSet <- lapply(paste0(dataDir, lF), fread)
-# dataSet <- rbindlist(dataSet)
-# file.remove(paste0(dataDir, lF))
-# write.csv(dataSet, 
-#           paste0(dataDir, "DM_Terms_Labels.csv"))
-# 
-# 
-# # - produce DM_Terms_Descriptions.csv
-# lF <- list.files(dataDir)
-# lF <- lF[grepl("DatamodelTerms_Descriptions", lF)]
-# dataSet <- lapply(paste0(dataDir, lF), fread)
-# dataSet <- rbindlist(dataSet)
-# file.remove(paste0(dataDir, lF))
-# colnames(dataSet) <- c('language', 'count', 'snapshot')
-# write.csv(dataSet, 
-#           paste0(dataDir, "DM_Terms_Descriptions.csv"))
-# 
-# # - produce DM_Terms_Aliases.csv
-# lF <- list.files(dataDir)
-# lF <- lF[grepl("DatamodelTerms_Aliases", lF)]
-# dataSet <- lapply(paste0(dataDir, lF), fread)
-# dataSet <- rbindlist(dataSet)
-# file.remove(paste0(dataDir, lF))
-# colnames(dataSet) <- c('language', 'count', 'snapshot')
-# write.csv(dataSet, 
-#           paste0(dataDir, "DM_Terms_Aliases.csv"))
-
-
-

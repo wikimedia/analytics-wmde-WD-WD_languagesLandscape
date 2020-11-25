@@ -71,7 +71,10 @@ logDir <- params$general$logDir
 outDir <- params$general$outDir
 publicDir <- params$general$pubDataDir
 hdfsPath <- params$general$hdfsPath
+
 ### --- spark2-submit parameters:
+params <- xmlParse(paste0(fPath, "WD_LanguagesLandscape_Config_Deploy.xml"))
+params <- xmlToList(params)
 sparkMaster <- params$spark$master
 sparkDeployMode <- params$spark$deploy_mode
 sparkNumExecutors <- params$spark$num_executors
@@ -96,10 +99,10 @@ system(command = 'sudo -u analytics-privatedata kerberos-run-command analytics-p
 system(command = paste0('sudo -u analytics-privatedata spark2-submit ', 
                         sparkMaster, ' ',
                         sparkDeployMode, ' ', 
-                        sparkNumExecutors, ' ',
                         sparkDriverMemory, ' ',
                         sparkExecutorMemory, ' ',
                         sparkExecutorCores, ' ',
+                        sparkConfigDynamic, ' ',
                         paste0(fPath, 'WD_LanguagesLandscape.py')),
        wait = T)
 
@@ -272,19 +275,31 @@ logDir <- params$general$logDir
 outDir <- params$general$outDir
 publicDir <- params$general$publicDir
 hdfsPath <- params$general$hdfsPath
+
+# - Set proxy
+Sys.setenv(
+  http_proxy = params$general$http_proxy,
+  https_proxy = params$general$http_proxy)
+
+### --- WDQS endpoint
+endPointURL <- params$general$wdqs_endpoint
+
+# - ML parameters
+tsne_theta <- as.numeric(params$general$tSNE_Theta)
+
+# - publicDir
+publicDir <- params$general$pubDataDir
+
 ### --- spark2-submit parameters:
+params <- xmlParse(paste0(fPath, "WD_LanguagesLandscape_Config_Deploy.xml"))
+params <- xmlToList(params)
 sparkMaster <- params$spark$master
 sparkDeployMode <- params$spark$deploy_mode
 sparkNumExecutors <- params$spark$num_executors
 sparkDriverMemory <- params$spark$driver_memory
 sparkExecutorMemory <- params$spark$executor_memory
 sparkExecutorCores <- params$spark$executor_cores
-# - ML parameters
-tsne_theta <- as.numeric(params$general$tSNE_Theta)
-# - Set proxy
-Sys.setenv(
-  http_proxy = params$general$http_proxy,
-  https_proxy = params$general$http_proxy)
+
 
 ### --- Functions
 source(paste0(fPath, 'WD_LanguagesLandscape_Functions.R'))
@@ -496,9 +511,6 @@ dmodelPropertiesLabs <- c('imnstanceOf', 'subclassOf', 'partOf', 'country',
 dmodelProps <- data.frame(dmodelProperties = dmodelProperties, 
                           propertyLabel = dmodelPropertiesLabs, 
                           stringsAsFactors = F)
-
-### --- WDQS endpoint
-endPointURL <- params$general$wdqs_endpoint
 
 ### --- Collect Language dataModel basics: languages + labels + WikimediaLanguage Code 
 # - Construct Query: languages from Q1288568 Modern Languages class
@@ -924,7 +936,6 @@ write.csv(dC,
 ### --------------------------------------------------------------
 ### --- 7. Copy data to publicDir
 ### --------------------------------------------------------------
-publicDir <- params$general$pubDataDir
 
 write(paste0("Last updated on: ", Sys.time()), 
       paste0(outDir, "WDLanguagesUpdateString.txt"))
